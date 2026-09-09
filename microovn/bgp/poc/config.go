@@ -144,7 +144,13 @@ protocol kernel egress {
   require extended next hop on;
   next hop self;
   import filter { if net = 0.0.0.0/0 then accept; reject; };
-  export filter { if proto = "advertisements" && net.len = 32 then accept; reject; };
+  export filter {
+   if proto = "advertisements" && net.len = 32 && defined(krt_metric) then {
+    bgp_med = krt_metric;
+    accept;
+   }
+   reject;
+  };
  };
 }
 `, i, j, c.LearnTable, iface, c.LocalASN, p.Address, p.ASN)

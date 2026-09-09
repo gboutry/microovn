@@ -32,6 +32,13 @@ advertisement kernel table. It does not provide IPv6 NLRI, BFD sessions, ECMP
 configuration, per-peer policy selection, or distinct VRFs per uplink yet.
 Unsupported JSON fields fail validation.
 
+Exported host routes must have a kernel metric. BIRD copies that metric into
+BGP MED so that OVN's route preference is preserved; routes without a metric
+are rejected. No subnet allowlist is imposed. Fabric peers must compare MED
+across neighboring ASNs when chassis use different ASNs (for BIRD, configure
+``med metric on`` on the receiving BGP sessions). This preserves preference;
+it does not itself enable ECMP or validate forwarding through a remote chassis.
+
 The command checks router/chassis and router/port/switch relationships before
 mutation. It adds a veth pair, an OVN switch port, routing-protocol redirect
 options on the existing router port, and a route-learning port mapping. BIRD's
