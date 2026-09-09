@@ -74,6 +74,13 @@ func DisableService(ctx context.Context, s state.State, service types.SrvName, a
 		}
 	}
 
+	// Keep the record on cleanup failure so a PoC teardown can be retried.
+	if service == types.SrvBgpPOC {
+		if err := bgp.DisablePOC(ctx, s); err != nil {
+			return err
+		}
+	}
+
 	err = s.Database().Transaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		err := database.DeleteService(ctx, tx, s.Name(), service)
 		return err
@@ -87,6 +94,8 @@ func DisableService(ctx context.Context, s state.State, service types.SrvName, a
 		leaveCentral(ctx, s, lastCentral)
 	case types.SrvChassis:
 		leaveChassis(ctx, s)
+	case types.SrvBgpPOC:
+		// Already cleaned up before removing the service record.
 	case types.SrvBgp:
 		err = bgp.DisableService(ctx, s)
 	default:
@@ -110,11 +119,28 @@ func EnableService(ctx context.Context, s state.State, service types.SrvName, ex
 		"Enabling service '%s' on node '%s'",
 		service, s.Name(),
 	)
+	if service == types.SrvBgp || service == types.SrvBgpPOC {
+		other := types.SrvBgp
+		if service == types.SrvBgp {
+			other = types.SrvBgpPOC
+		}
+		active, err := HasServiceActive(ctx, s, other)
+		if err != nil {
+			return err
+		}
+		if active {
+			return fmt.Errorf("disable %s before enabling %s", other, service)
+		}
+	}
+
 	exists, err := HasServiceActive(ctx, s, service)
 	if err != nil {
 		return err
 	}
 	if exists {
+		if service == types.SrvBgpPOC {
+			return bgp.EnablePOC(ctx, s)
+		}
 		return errors.New("this service is already enabled")
 	}
 
@@ -140,6 +166,8 @@ func EnableService(ctx context.Context, s state.State, service types.SrvName, ex
 		err = joinCentral(ctx, s)
 	case types.SrvChassis:
 		err = joinChassis(ctx, s)
+	case types.SrvBgpPOC:
+		err = bgp.EnablePOC(ctx, s)
 	case types.SrvBgp:
 		err = bgp.EnableService(ctx, s, extraConfig.BgpConfig)
 	default:
@@ -147,6 +175,9 @@ func EnableService(ctx context.Context, s state.State, service types.SrvName, ex
 	}
 
 	if err != nil {
+		if service == types.SrvBgpPOC {
+			return err
+		}
 		dberr := s.Database().Transaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
 			err := database.DeleteService(ctx, tx, s.Name(), service)
 			return err
@@ -456,20 +487,26 @@ func deactivateService(ctx context.Context, service types.SrvName, disable bool)
 // ActivateEnabledServices iterates through all enabled services on the nodes
 // and ensures the corresponding snap services are active
 func ActivateEnabledServices(ctx context.Context, s state.State, enable bool) error {
+	var services []database.Service
 	err := s.Database().Transaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		// Get list of all active local services.
 		name := s.Name()
-		services, err := database.GetServices(ctx, tx, database.ServiceFilter{Member: &name})
+		var err error
+		services, err = database.GetServices(ctx, tx, database.ServiceFilter{Member: &name})
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	// Activation may query cluster endpoints; do not hold a database transaction.
+	for _, srv := range services {
+		if srv.Service == types.SrvBgpPOC {
+			err = bgp.EnablePOC(ctx, s)
+		} else {
+			err = activateService(ctx, srv.Service, enable)
+		}
 		if err != nil {
 			return err
 		}
-		for _, srv := range services {
-			err = activateService(ctx, srv.Service, enable)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	return err
+	}
+	return nil
 }

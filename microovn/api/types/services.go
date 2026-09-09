@@ -108,10 +108,12 @@ const (
 	SrvSwitch SrvName = "switch"
 	// SrvBgp - string representation of BGP service
 	SrvBgp SrvName = "bgp"
+	// SrvBgpPOC attaches BIRD to externally owned OVN topology.
+	SrvBgpPOC SrvName = "bgp-poc"
 )
 
 // ServiceNames - slice containing all known SrvName strings.
-var ServiceNames = []SrvName{SrvBgp, SrvChassis, SrvCentral, SrvSwitch}
+var ServiceNames = []SrvName{SrvBgp, SrvBgpPOC, SrvChassis, SrvCentral, SrvSwitch}
 
 // ExtraServiceConfig - structure containing optional extra configuration for enabling service
 type ExtraServiceConfig struct {
