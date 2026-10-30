@@ -13,12 +13,12 @@ import (
 	"time"
 )
 
-// Run executes a command without a shell. Command names are nb, ovs, ip, bird,
-// birdc, start and stop; callers bind them to MicroOVN's existing wrappers.
+// Run executes a command without a shell. Command names are nb, sb, ovs, ofctl,
+// ip, bird, birdc, start and stop; callers bind them to existing wrappers.
 type Run func(context.Context, string, ...string) (string, error)
 
-// Runtime applies an explicit snapshot. Re-run enable after desired changes;
-// this PoC deliberately does not claim to provide a background reconciler.
+// Runtime applies one explicit snapshot. Controller optionally repeats apply
+// for Neutron compatibility; configuration changes still require disable.
 type Runtime struct {
 	Run        Run
 	Dir        string
@@ -34,9 +34,10 @@ type attachment struct {
 }
 
 type journal struct {
-	Config      Config       `json:"config"`
-	Attachments []attachment `json:"attachments"`
-	Bird        []byte       `json:"bird"`
+	Config      Config          `json:"config"`
+	Attachments []attachment    `json:"attachments"`
+	Bird        []byte          `json:"bird"`
+	Neutron     *neutronJournal `json:"neutron,omitempty"`
 }
 
 func value(s string) string {
@@ -103,17 +104,31 @@ func atomicFile(path string, data []byte, mode os.FileMode) error {
 	return os.Rename(f.Name(), path)
 }
 
-// Enable validates the whole configuration and records cleanup information
-// before changing any resources. Existing journals permit retry after failure.
+// Enable validates desired configuration and journals cleanup information.
+// Compatibility publication can precede external topology readiness; journals
+// permit retry after failure without losing the original cleanup state.
 func (r Runtime) Enable(ctx context.Context) error {
-	raw, err := r.get(ctx, "ovs", "Open_vSwitch", ".", "external_ids:"+ExternalID)
+	c, err := r.Config(ctx)
 	if err != nil {
 		return err
 	}
+	return r.enable(ctx, c)
+}
+
+// Config reads one complete desired snapshot from local OVS.
+func (r Runtime) Config(ctx context.Context) (Config, error) {
+	raw, err := r.get(ctx, "ovs", "Open_vSwitch", ".", "external_ids:"+ExternalID)
+	if err != nil {
+		return Config{}, err
+	}
 	c, err := Parse([]byte(raw))
 	if err != nil {
-		return fmt.Errorf("invalid %s: %w", ExternalID, err)
+		return c, fmt.Errorf("invalid %s: %w", ExternalID, err)
 	}
+	return c, nil
+}
+
+func (r Runtime) enable(ctx context.Context, c Config) error {
 	if !objectName.MatchString(r.Chassis) {
 		return fmt.Errorf("invalid chassis identity")
 	}
@@ -127,12 +142,40 @@ func (r Runtime) Enable(ctx context.Context) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	} else {
-		j, err = r.preflight(ctx, c)
-		if err != nil {
+		if c.Neutron != nil {
+			j, err = r.neutronSnapshot(ctx, c)
+			if err != nil {
+				return err
+			}
+			if err = r.save(j); err != nil {
+				return err
+			}
+		} else {
+			j, err = r.preflight(ctx, c)
+			if err != nil {
+				return err
+			}
+			if err = r.save(j); err != nil {
+				return err
+			}
+		}
+	}
+	if c.Neutron != nil {
+		if j.Neutron == nil {
+			return fmt.Errorf("missing Neutron cleanup journal")
+		}
+		if err = r.neutronPublish(ctx, c); err != nil {
 			return err
 		}
-		if err = r.save(j); err != nil {
-			return err
+		if len(j.Attachments) == 0 {
+			prepared, e := r.preflight(ctx, c)
+			if e != nil {
+				return e
+			}
+			j.Attachments = prepared.Attachments
+			if err = r.save(j); err != nil {
+				return err
+			}
 		}
 	}
 	// Validate BIRD syntax before changing topology or replacing the running file.
@@ -144,8 +187,16 @@ func (r Runtime) Enable(ctx context.Context) error {
 		return err
 	}
 	for _, a := range j.Attachments {
+		if err = r.validateAttachment(ctx, c, a); err != nil {
+			return err
+		}
 		if err = r.attach(ctx, c, a); err != nil {
 			return fmt.Errorf("attach %s: %w (disable bgp-poc cleans up)", a.Uplink.Bridge, err)
+		}
+	}
+	if c.Neutron != nil {
+		if err = r.neutronFlows(ctx, c); err != nil {
+			return err
 		}
 	}
 	if err = atomicFile(r.BirdConfig, []byte(c.Bird()), 0644); err != nil {
@@ -254,7 +305,7 @@ func (r Runtime) preflight(ctx context.Context, c Config) (journal, error) {
 		keys[key] = true
 		a := attachment{Uplink: u, MAC: mac, MappingKey: key}
 		for _, mapping := range strings.Split(mappings, ",") {
-			k, v, ok := strings.Cut(mapping, "=")
+			k, v, ok := splitMapping(mapping)
 			if ok && k == key {
 				a.OldMapping = v
 			}
@@ -283,8 +334,8 @@ func (r Runtime) mapping(ctx context.Context, key, value string) error {
 	}
 	var mappings []string
 	for _, m := range strings.Split(old, ",") {
-		k, _, ok := strings.Cut(m, "=")
-		if ok && k != key {
+		k, _, ok := splitMapping(m)
+		if m != "" && (!ok || k != key) {
 			mappings = append(mappings, m)
 		}
 	}
@@ -303,6 +354,9 @@ func (r Runtime) attach(ctx context.Context, c Config, a attachment) error {
 	u := a.Uplink
 	host, ovs := u.Interfaces()
 	lsp := u.PortName(r.Chassis)
+	if err := r.validateLocalInterface(ctx, ovs); err != nil {
+		return err
+	}
 	vrf := fmt.Sprintf("ovnvrf%d", c.LearnTable)
 	// OVN owns the VRF. Wait for it instead of creating a competing Linux object.
 	if _, err := r.Run(ctx, "ip", "link", "show", "dev", vrf); err != nil {
@@ -347,6 +401,11 @@ func (r Runtime) Disable(ctx context.Context) error {
 	if _, err = r.Run(ctx, "stop"); err != nil {
 		return err
 	}
+	if j.Neutron != nil {
+		if err = r.neutronCleanup(ctx, j); err != nil {
+			return err
+		}
+	}
 	for _, a := range j.Attachments {
 		u := a.Uplink
 		host, ovs := u.Interfaces()
@@ -382,6 +441,9 @@ func (r Runtime) Disable(ctx context.Context) error {
 				return err
 			}
 		}
+		if err = r.validateLocalInterface(ctx, ovs); err != nil {
+			return err
+		}
 		if _, err = r.Run(ctx, "ovs", "--if-exists", "del-port", ovs); err != nil {
 			return err
 		}
@@ -398,4 +460,22 @@ func (r Runtime) Disable(ctx context.Context) error {
 		return err
 	}
 	return os.Remove(r.path())
+}
+
+func (r Runtime) validateLocalInterface(ctx context.Context, iface string) error {
+	name, err := r.get(ctx, "ovs", "Interface", iface, "name")
+	if err != nil {
+		return err
+	}
+	if name == "" {
+		return nil
+	}
+	owner, err := r.get(ctx, "ovs", "Interface", iface, "external_ids:"+ExternalID)
+	if err != nil {
+		return err
+	}
+	if owner != r.Chassis {
+		return fmt.Errorf("local attachment interface ownership changed")
+	}
+	return nil
 }

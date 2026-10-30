@@ -15,14 +15,26 @@ import (
 // ExternalID holds a complete, versioned desired configuration on Open_vSwitch.
 const ExternalID = "microovn-bgp-poc"
 
-// Config is supplied by the external topology owner, without CMS-specific keys.
+// Config is supplied by the topology/deployment owner. Neutron compatibility is
+// opt-in; configurations without it retain the generic explicit-apply mode.
 type Config struct {
-	Version        int      `json:"version"`
-	RouterID       string   `json:"router_id"`
-	LocalASN       uint32   `json:"local_asn"`
-	AdvertiseTable uint32   `json:"advertise_table"`
-	LearnTable     uint32   `json:"learn_table"`
-	Uplinks        []Uplink `json:"uplinks"`
+	Version        int            `json:"version"`
+	RouterID       string         `json:"router_id"`
+	LocalASN       uint32         `json:"local_asn"`
+	AdvertiseTable uint32         `json:"advertise_table"`
+	LearnTable     uint32         `json:"learn_table"`
+	Uplinks        []Uplink       `json:"uplinks"`
+	Neutron        *NeutronConfig `json:"neutron,omitempty"`
+}
+
+// NeutronConfig opts into compatibility with Neutron's existing BGP topology.
+// Both logical switches and their router ports remain externally owned.
+type NeutronConfig struct {
+	Bridge          string `json:"interconnect_bridge"`
+	ProviderNetwork string `json:"provider_network"`
+	ProviderSwitch  string `json:"provider_switch"`
+	Switch          string `json:"interconnect_switch"`
+	RouterPort      string `json:"interconnect_router_port"`
 }
 
 // Uplink attaches an existing router port to a host routing daemon.
@@ -71,6 +83,16 @@ func (c Config) Validate() error {
 	if len(c.Uplinks) == 0 {
 		return fmt.Errorf("at least one uplink is required")
 	}
+	if n := c.Neutron; n != nil {
+		for _, name := range []string{n.Bridge, n.ProviderNetwork, n.ProviderSwitch, n.Switch, n.RouterPort} {
+			if !objectName.MatchString(name) || len(name) > 240 {
+				return fmt.Errorf("invalid Neutron attachment name %q", name)
+			}
+		}
+		if len(n.Bridge) > 15 || n.ProviderSwitch == n.Switch {
+			return fmt.Errorf("require a Linux interconnect bridge and distinct switches")
+		}
+	}
 	bridges, ports := map[string]bool{}, map[string]bool{}
 	for _, u := range c.Uplinks {
 		for _, name := range []string{u.Bridge, u.Router, u.RouterPort, u.Switch} {
@@ -80,6 +102,9 @@ func (c Config) Validate() error {
 		}
 		if len(u.Bridge) > 15 || bridges[u.Bridge] || ports[u.RouterPort] {
 			return fmt.Errorf("duplicate uplink or invalid bridge %q", u.Bridge)
+		}
+		if c.Neutron != nil && (u.Bridge == c.Neutron.Bridge || u.Bridge == c.Neutron.ProviderNetwork) {
+			return fmt.Errorf("interconnect and uplink mappings must be distinct")
 		}
 		bridges[u.Bridge], ports[u.RouterPort] = true, true
 		if len(u.Peers) == 0 {

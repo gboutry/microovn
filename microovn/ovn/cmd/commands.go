@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/logger"
@@ -218,20 +219,30 @@ func NBCtl(ctx context.Context, s state.State, args ...string) (string, error) {
 //
 // Warning: This function will fail if local MicroOVN node is not bootstrapped.
 func NBCtlCluster(ctx context.Context, s state.State, args ...string) (string, error) {
+	return clusterDBCtl(ctx, s, "OVN_Northbound", "ovn-nbctl", 6641, args...)
+}
+
+// SBCtlCluster executes ovn-sbctl against the cluster with the same connection
+// checks, TLS wrapper and retry policy as NBCtlCluster.
+func SBCtlCluster(ctx context.Context, s state.State, args ...string) (string, error) {
+	return clusterDBCtl(ctx, s, "OVN_Southbound", "ovn-sbctl", 6642, args...)
+}
+
+func clusterDBCtl(ctx context.Context, s state.State, database, command string, port int, args ...string) (string, error) {
 	if !slices.Contains(args, "--timeout") && !slices.Contains(args, "-t") {
 		args = append([]string{"--timeout", "30"}, args...)
 	}
 
 	var err error
-	err = WaitForClusterDBState(ctx, s, "OVN_Northbound", OvsdbConnected, 6641)
+	err = WaitForClusterDBState(ctx, s, database, OvsdbConnected, port)
 	if err != nil {
-		return "", errors.New("failed to connect to OVN Northbound database cluster")
+		return "", fmt.Errorf("failed to connect to OVN %s database cluster", strings.TrimPrefix(database, "OVN_"))
 	}
 
 	// try command 3 times if it is failing
 	for attempts := 0; attempts < 3; attempts++ {
 		var output string
-		output, err = shared.RunCommandContext(ctx, filepath.Join(paths.Wrappers(), "ovn-nbctl"), args...)
+		output, err = shared.RunCommandContext(ctx, filepath.Join(paths.Wrappers(), command), args...)
 		if err == nil {
 			return output, nil
 		}
